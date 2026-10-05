@@ -1,86 +1,71 @@
 # texture-pipeline
 
-AI-driven 3D asset pipeline: alpha-to-geometry, multi-view diffusion texturing,
-and optional self-hosted UniRig rigging. Designed so an LLM agent (MiMo-V2.6,
-Claude, etc.) can drive the whole thing through one function call.
-
-## Pipeline
+Full text-to-3D and image-to-3D pipeline, plus alpha-to-geometry and an
+optional voxel remesh. An LLM agent drives it with one call.
 
 ```
-alpha mask ──> alpha_to_geometry ──> mesh (GLB)
-                                        │
-                                        ▼
-                              render_views (Blender, N orbiting cams)
-                                        │
-                                        ▼
-                              diffuse_views (OpenRouter: Seedream / Flux / ...)
-                                        │
-                                        ▼
-                              bake_textures (project views onto UV atlas)
-                                        │
-                                        ▼
-                              textured GLB ──> [optional] rig_textured_mesh (UniRig)
-                                                              │
-                                                              ▼
-                                                    Mixamo-spec FBX (Unity/Unreal/iOS ready)
+prompt  ──> OpenRouter reference image ──> Hunyuan3D shape ──┐
+image   ──> Hunyuan3D shape ─────────────────────────────────┤
+alpha   ──> alpha_to_geometry ───────────────────────────────┤
+mesh    ─────────────────────────────────────────────────────┤
+                                                             ▼
+                                              optional voxel remesh
+                                                             ▼
+                                         render views -> OpenRouter diffuse -> bake GLB
+                                                             ▼
+                                              optional UniRig (Mixamo FBX)
 ```
 
-## Why this order
+Voxel remesh and alpha meshing both change topology, so the texture pass
+always re-runs on the mesh that actually comes out. Rigging is last.
 
-Any mesh-changing step destroys rig data — bones, skin weights, animation
-bindings. So rigging is always last, and it's a separate explicit call the
-agent makes after texturing. The agent wrapper enforces this by running
-render → diffuse → bake as a fresh sequence on whatever mesh it receives.
-
-## Files
-
-| File | Role |
-|------|------|
-| `alpha_to_geometry.py` | Alpha-masked image → subdivided, displaced, decimated mesh |
-| `texture_pipeline.py` | Blender render + bake passes |
-| `openrouter_texture.py` | OpenRouter image API (Seedream 4.5 default, swappable) |
-| `unirig_rig.py` | **Self-hosted UniRig rigging** (new) |
-| `ai_texture_agent.py` | One-function agent entry: `texture_mesh()` + `rig_textured_mesh()` |
-
-## Quick start
+## Usage
 
 ```bash
-# Texture only
-python ai_texture_agent.py bush_alpha.png "dense forest bush, PBR" bush.glb
+export OPENROUTER_API_KEY=sk-or-v1-...
+export HY3D_ROOT=~/Hunyuan3D-2.1          # text/image-to-3D
+export UNIRIG_ROOT=~/UniRig               # optional rig
+export BLENDER_BIN=blender
 
-# Texture + rig (UniRig must be cloned + weights downloaded)
-python ai_texture_agent.py bush.glb "dense forest bush" bush.glb --rig biped
+# text to textured GLB, with a watertight voxel remesh
+python ai_texture_agent.py fern.glb "dense green fern, soft studio light" \
+  --source-prompt "a single fern frond, game asset" --voxel 0.03
+
+# image to 3D + rig
+python ai_texture_agent.py fern.glb "dense green fern" --image photo.png --rig biped
+
+# alpha sprite to mesh (no Hunyuan needed)
+python ai_texture_agent.py bush.glb "dense foliage" --alpha bush.png --voxel 0.02
 ```
 
-## UniRig setup (optional rigging pass)
+## Shape generation
 
-```bash
-git clone https://github.com/VAST-AI-Research/UniRig
-# download weights from https://huggingface.co/VAST-AI/UniRig
-export UNIRIG_ROOT=~/UniRig
-```
+`shape_gen.py` writes a reference image (OpenRouter, transparent background)
+then runs Hunyuan3D-2.1's shape DiT if `HY3D_ROOT` is set. Without Hunyuan
+it exits 3 after saving the reference image — texture-only mode on an
+existing `--mesh` still works.
 
-UniRig is MIT-licensed, runs on a single consumer GPU (a 3090 is plenty),
-and outputs Mixamo-spec FBX. It handles seven body plans: biped, quadruped,
-hexapod, octopod, avian, serpentine, aquatic. It's nondeterministic, so
-`unirig_rig.py` retries up to 3 times on degenerate skeletons — same pattern
-people use with Tripo's rig endpoint, except retries here cost GPU-seconds,
-not cents.
+Hunyuan3D-2.1: https://github.com/Tencent-Hunyuan/Hunyuan3D-2.1
+Shape stage is about 10 GB VRAM; their paint stage is ~21 GB. This repo
+does not use their paint stage — texturing stays on the OpenRouter view bake
+so you can swap models.
 
-## Cost per asset (textured, 6 views)
+## Voxel remesh
 
-- OpenRouter Seedream 4.5: ~$0.04/image → ~$0.24
-- Blender render/bake: free on owned hardware
-- UniRig rig pass: ~$0.01–0.02 GPU time
-- **Total: roughly 25–30 cents**, vs 60+ cents on Meshy/Tripo for equivalent output
+`voxel_remesh.py` applies Blender's voxel Remesh modifier, smooths, and
+re-unwraps. This is the path that turns a flat alpha puff into a closed
+volume. Smaller `--voxel` means more detail and more triangles.
 
-## Honest limits
+## Cost
 
-- Bake pass is naive per-triangle rasterization — expect seams on complex
-  meshes. Swap for xatlas + proper projection for production.
-- Alpha displacement only pushes along normals: puffy silhouette, no true
-  volume or overhangs. For real 3D volume, a voxel remesh / marching-cubes
-  pass is the next step (not yet wired in).
-- UniRig's research-grade CLI means `unirig_rig.py` tries several invocation
-  patterns; if your UniRig version differs, point it at the right script or
-  set up the import path.
+- Reference image: ~$0.04 (Seedream 4.5)
+- Six texture views: ~$0.24
+- Hunyuan shape: local GPU, not an API charge
+- UniRig: local GPU
+- Hosted Meshy/Tripo full asset: about $0.30–$0.60, geometry included
+
+## Limits
+
+- Bake is naive per-triangle projection. Seams on complex meshes.
+- Hunyuan and UniRig CLIs drift; the wrappers try the documented entry points.
+- Rigging after remesh is required — remesh deletes bones.

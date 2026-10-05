@@ -1,184 +1,147 @@
 #!/usr/bin/env python3
-"""ai_texture_agent.py — One-function agent entry point for the full pipeline.
+"""ai_texture_agent.py — one entry point for the full pipeline.
 
-texture_mesh(mesh, prompt, out) drives: alpha-to-geometry -> render -> diffuse
--> bake, and optionally rigs the result with self-hosted UniRig.
+Modes (pick one source):
+  --prompt "a fern"          text -> reference image -> Hunyuan3D mesh
+  --image photo.png          image -> Hunyuan3D mesh
+  --alpha bush.png           alpha mask -> displaced silhouette mesh
+  --mesh bush.glb            existing mesh
 
-The LLM (MiMo-V2.6, Claude, whatever) is the orchestrator: it picks prompts,
-models, and retry policy. This module never touches pixels directly — it
-shells out to Blender for geometry/render/bake and calls OpenRouter for
-diffusion. Rigging is a separate optional pass because any mesh-changing step
-destroys rig data, so it must come last.
+Then always:
+  optional --voxel 0.02      watertight remesh (kills UVs, so texture re-runs)
+  render orbiting views
+  OpenRouter diffuse each view
+  bake onto UVs, export GLB
+  optional --rig biped       UniRig, last, because remesh destroys bones
 
-Usage:
-    from ai_texture_agent import texture_mesh, rig_textured_mesh
-
-    glb = texture_mesh("bush_alpha.png", "dense forest bush, PBR", "bush.glb")
-    rigged = rig_textured_mesh(glb, body_plan="biped")   # optional
+Example:
+  python ai_texture_agent.py --prompt "low poly fern" fern.glb --voxel 0.03
+  python ai_texture_agent.py --image photo.png fern.glb --rig biped
 """
-
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 import sys
 from pathlib import Path
-from typing import Optional
 
-from alpha_to_geometry import alpha_to_mesh
-from openrouter_texture import diffuse_views
-from texture_pipeline import bake_textures, render_views
+BLENDER = os.environ.get("BLENDER_BIN", "blender")
+HERE = Path(__file__).resolve().parent
 
 
-# ---------------------------------------------------------------------------
-# Pipeline stages
-# ---------------------------------------------------------------------------
+def run(cmd: list[str]) -> None:
+    print("+", " ".join(cmd), flush=True)
+    subprocess.run(cmd, check=True)
 
-def texture_mesh(
-    mesh: str | Path,
-    prompt: str,
-    out: str | Path = "textured.glb",
+
+def make_shape(prompt, image, alpha, mesh, work: Path, model: str, blender: str) -> Path:
+    """Return a GLB path. Exactly one of prompt/image/alpha/mesh should be set."""
+    if mesh:
+        return Path(mesh)
+    if alpha:
+        out = work / "alpha_mesh.glb"
+        run([
+            blender, "-b", "-P", str(HERE / "alpha_to_geometry.py"), "--",
+            "--image", str(alpha), "--out", str(out), "--workdir", str(work),
+        ])
+        return out
+    if prompt or image:
+        out = work / "shape.glb"
+        cmd = [sys.executable, str(HERE / "shape_gen.py"), "--out", str(out), "--model", model]
+        if image:
+            cmd += ["--image", str(image)]
+        else:
+            cmd += ["--prompt", prompt, "--ref-out", str(work / "reference.png")]
+        run(cmd)
+        return out
+    raise SystemExit("need --prompt, --image, --alpha, or --mesh")
+
+
+def texture_asset(
+    out: str | Path,
     *,
-    alpha_mask: Optional[str | Path] = None,
+    prompt: str,
+    source_prompt: str | None = None,
+    image: str | None = None,
+    alpha: str | None = None,
+    mesh: str | None = None,
+    voxel: float | None = None,
     views: int = 6,
+    res: int = 1024,
     model: str = "bytedance-seed/seedream-4.5",
-    api_key: Optional[str] = None,
-    blender: str = "blender",
-    work_dir: Optional[str | Path] = None,
+    rig: str | None = None,
+    workdir: str | None = None,
+    blender: str = BLENDER,
 ) -> Path:
-    """Full texture pipeline for one asset.
-
-    1. If alpha_mask is given, run alpha-to-geometry first — the mesh gets
-       created/defined from the masked image before anything else.
-    2. Render orbiting views (transparent BG).
-    3. Diffuse each view via OpenRouter (Seedream default, swappable).
-    4. Bake projected views back onto the UV atlas.
-
-    Because alpha meshing changes topology, any texture baked against old UVs
-    won't line up — so the render/diffuse/bake sequence always runs fresh on
-    whatever mesh it receives. Never reuse a prior bake.
-
-    Parameters
-    ----------
-    mesh : input mesh, or ignored if alpha_mask is provided
-    prompt : text prompt for the diffusion pass
-    out : final GLB path
-    alpha_mask : optional masked image -> alpha-to-geometry pre-pass
-    views : number of orbiting cameras
-    model : OpenRouter image model id
-    api_key : OpenRouter key (falls back to OPENROUTER_API_KEY env)
-    blender : Blender executable
-    work_dir : scratch directory for intermediates
-
-    Returns
-    -------
-    Path to the textured GLB.
-    """
     out = Path(out)
-    work = Path(work_dir) if work_dir else out.parent / f".{out.stem}_work"
+    work = Path(workdir) if workdir else out.parent / f"_work_{out.stem}"
     work.mkdir(parents=True, exist_ok=True)
 
-    # Stage 0: alpha-to-geometry (mesh gets created and defined here)
-    current_mesh = Path(mesh)
-    if alpha_mask is not None:
-        current_mesh = alpha_to_mesh(
-            alpha_mask,
-            out=work / f"{out.stem}_alpha.glb",
-            blender=blender,
-        )
-        print(f"[agent] alpha mesh: {current_mesh}")
+    current = make_shape(source_prompt, image, alpha, mesh, work, model, blender)
 
-    # Stage 1: render views
-    manifest = render_views(current_mesh, work / "views", n_views=views, blender=blender)
-    print(f"[agent] rendered {views} views -> {manifest}")
+    if voxel is not None:
+        remeshed = work / "voxel.glb"
+        run([
+            blender, "-b", "-P", str(HERE / "voxel_remesh.py"), "--",
+            "--mesh", str(current), "--out", str(remeshed), "--voxel", str(voxel),
+        ])
+        current = remeshed
 
-    # Stage 2: diffuse
-    diffused = diffuse_views(manifest, prompt, work / "diffused", model=model, api_key=api_key)
-    print(f"[agent] diffused {len(diffused)} views")
+    # texture always re-runs on the mesh we actually have
+    run([
+        blender, "-b", "-P", str(HERE / "texture_pipeline.py"), "--",
+        "--mesh", str(current), "--out", str(out),
+        "--views", str(views), "--res", str(res), "--workdir", str(work),
+    ])
+    run([
+        sys.executable, str(HERE / "openrouter_texture.py"),
+        "--workdir", str(work), "--model", model, "--prompt", prompt,
+    ])
+    run([
+        blender, "-b", "-P", str(HERE / "texture_pipeline.py"), "--",
+        "--mesh", str(current), "--out", str(out),
+        "--views", str(views), "--res", str(res), "--workdir", str(work), "--bake",
+    ])
 
-    # Stage 3: bake
-    bake_textures(current_mesh, diffused, manifest, out, blender=blender)
-    print(f"[agent] baked -> {out}")
+    if rig:
+        run([
+            sys.executable, str(HERE / "unirig_rig.py"),
+            str(out), "-p", rig, "-o", str(out.with_suffix(".fbx")),
+        ])
     return out
 
 
-def rig_textured_mesh(
-    mesh: str | Path,
-    *,
-    body_plan: str = "biped",
-    out: Optional[str | Path] = None,
-    max_attempts: int = 3,
-    unirig_root: Optional[str | Path] = None,
-):
-    """Optional post-texture rigging pass via self-hosted UniRig.
-
-    Must run AFTER texturing: any mesh-changing step destroys bones, skin
-    weights, and animation bindings. This is why rigging is a separate
-    function the agent calls explicitly rather than being baked into
-    texture_mesh().
-
-    Lazy-imports unirig_rig so the texture pipeline works without UniRig
-    installed — rigging is opt-in.
-    """
-    from unirig_rig import rig_mesh
-
-    mesh = Path(mesh)
-    out = Path(out) if out else mesh.with_name(f"{mesh.stem}_rigged.fbx")
-    result = rig_mesh(
-        mesh,
-        body_plan=body_plan,
-        out=out,
-        max_attempts=max_attempts,
-        unirig_root=unirig_root,
-    )
-    tag = "DEGENERATE" if result.degenerate else "OK"
-    print(
-        f"[agent] rig [{tag}] {result.fbx_path} | {result.skeleton_joints} joints | "
-        f"{result.body_plan} | attempt {result.attempt}/{max_attempts}"
-    )
-    return result
-
-
-# ---------------------------------------------------------------------------
-# CLI: agent-style one-shot
-    #   python ai_texture_agent.py bush_alpha.png "dense forest bush" bush.glb
-    #   python ai_texture_agent.py bush.glb "dense forest bush" bush.glb --rig biped
-# ---------------------------------------------------------------------------
-
 def main() -> None:
-    p = argparse.ArgumentParser(description="Agent entry point: texture (+ optional rig)")
-    p.add_argument("mesh", help="Input mesh, or alpha-masked image if --alpha given")
-    p.add_argument("prompt", help="Diffusion prompt")
-    p.add_argument("out", help="Output GLB path")
-    p.add_argument("--alpha", help="Alpha mask image -> alpha-to-geometry pre-pass")
+    p = argparse.ArgumentParser(description="text/image/alpha/mesh -> textured GLB")
+    p.add_argument("out")
+    p.add_argument("prompt", help="surface description used for the texture pass")
+    src = p.add_mutually_exclusive_group(required=True)
+    src.add_argument("--source-prompt", help="text-to-3D: generate shape from this prompt")
+    src.add_argument("--image", help="image-to-3D")
+    src.add_argument("--alpha", help="alpha mask to silhouette mesh")
+    src.add_argument("--mesh", help="existing mesh, skip shape gen")
+    p.add_argument("--voxel", type=float, default=None, help="voxel size; omit to skip remesh")
     p.add_argument("--views", type=int, default=6)
+    p.add_argument("--res", type=int, default=1024)
     p.add_argument("--model", default="bytedance-seed/seedream-4.5")
-    p.add_argument("--rig", choices=["biped", "quadruped", "hexapod", "octopod", "avian", "serpentine", "aquatic"],
-                   help="Optional UniRig pass after texturing")
-    p.add_argument("--rig-attempts", type=int, default=3)
-    p.add_argument("--unirig-root", default=None)
-    p.add_argument("--blender", default="blender")
-    p.add_argument("--work-dir", default=None)
-    args = p.parse_args()
-
-    glb = texture_mesh(
-        args.mesh,
-        args.prompt,
-        args.out,
-        alpha_mask=args.alpha,
-        views=args.views,
-        model=args.model,
-        blender=args.blender,
-        work_dir=args.work_dir,
+    p.add_argument("--rig", default=None)
+    p.add_argument("--workdir", default=None)
+    a = p.parse_args()
+    texture_asset(
+        a.out,
+        prompt=a.prompt,
+        source_prompt=a.source_prompt,
+        image=a.image,
+        alpha=a.alpha,
+        mesh=a.mesh,
+        voxel=a.voxel,
+        views=a.views,
+        res=a.res,
+        model=a.model,
+        rig=a.rig,
+        workdir=a.workdir,
     )
-
-    if args.rig:
-        rig_textured_mesh(
-            glb,
-            body_plan=args.rig,
-            max_attempts=args.rig_attempts,
-            unirig_root=args.unirig_root,
-        )
 
 
 if __name__ == "__main__":
