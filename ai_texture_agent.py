@@ -1,22 +1,21 @@
 #!/usr/bin/env python3
-"""ai_texture_agent.py — one entry point for the full pipeline.
+"""ai_texture_agent.py — Higgsfield-style path, no 3D generator.
 
-Modes (pick one source):
-  --prompt "a fern"          text -> reference image -> Hunyuan3D mesh
-  --image photo.png          image -> Hunyuan3D mesh
-  --alpha bush.png           alpha mask -> displaced silhouette mesh
-  --mesh bush.glb            existing mesh
+The LLM's job is the mesh, and the mesh is dumb on purpose:
+  a plane or a cube it can emit itself (primitive_mesh.py), or any GLB it wrote.
 
-Then always:
-  optional --voxel 0.02      watertight remesh (kills UVs, so texture re-runs)
-  render orbiting views
-  OpenRouter diffuse each view
-  bake onto UVs, export GLB
-  optional --rig biped       UniRig, last, because remesh destroys bones
+Stable Diffusion does the look:
+  render the primitive, paint each view through OpenRouter, bake to UVs.
 
-Example:
-  python ai_texture_agent.py --prompt "low poly fern" fern.glb --voxel 0.03
-  python ai_texture_agent.py --image photo.png fern.glb --rig biped
+Geometry detail comes FROM that texture, not from a shape model:
+  1. ask the image model for a transparent-background paint
+  2. alpha-cut + displace the primitive using the baked texture
+  3. optional voxel remesh to close it into a volume
+
+Rigging, if any, is last.
+
+    python ai_texture_agent.py bush.glb "dense green bush, cutout foliage" --primitive plane
+    python ai_texture_agent.py crate.glb "weathered wood crate" --primitive cube --no-displace
 """
 from __future__ import annotations
 
@@ -35,41 +34,17 @@ def run(cmd: list[str]) -> None:
     subprocess.run(cmd, check=True)
 
 
-def make_shape(prompt, image, alpha, mesh, work: Path, model: str, blender: str) -> Path:
-    """Return a GLB path. Exactly one of prompt/image/alpha/mesh should be set."""
-    if mesh:
-        return Path(mesh)
-    if alpha:
-        out = work / "alpha_mesh.glb"
-        run([
-            blender, "-b", "-P", str(HERE / "alpha_to_geometry.py"), "--",
-            "--image", str(alpha), "--out", str(out), "--workdir", str(work),
-        ])
-        return out
-    if prompt or image:
-        out = work / "shape.glb"
-        cmd = [sys.executable, str(HERE / "shape_gen.py"), "--out", str(out), "--model", model]
-        if image:
-            cmd += ["--image", str(image)]
-        else:
-            cmd += ["--prompt", prompt, "--ref-out", str(work / "reference.png")]
-        run(cmd)
-        return out
-    raise SystemExit("need --prompt, --image, --alpha, or --mesh")
-
-
 def texture_asset(
     out: str | Path,
-    *,
     prompt: str,
-    source_prompt: str | None = None,
-    image: str | None = None,
-    alpha: str | None = None,
+    *,
     mesh: str | None = None,
-    voxel: float | None = None,
+    primitive: str | None = "plane",
     views: int = 6,
     res: int = 1024,
     model: str = "bytedance-seed/seedream-4.5",
+    displace: bool = True,
+    voxel: float | None = None,
     rig: str | None = None,
     workdir: str | None = None,
     blender: str = BLENDER,
@@ -78,17 +53,14 @@ def texture_asset(
     work = Path(workdir) if workdir else out.parent / f"_work_{out.stem}"
     work.mkdir(parents=True, exist_ok=True)
 
-    current = make_shape(source_prompt, image, alpha, mesh, work, model, blender)
-
-    if voxel is not None:
-        remeshed = work / "voxel.glb"
+    current = Path(mesh) if mesh else work / "primitive.glb"
+    if not mesh:
         run([
-            blender, "-b", "-P", str(HERE / "voxel_remesh.py"), "--",
-            "--mesh", str(current), "--out", str(remeshed), "--voxel", str(voxel),
+            sys.executable, str(HERE / "primitive_mesh.py"),
+            "--kind", primitive or "plane", "--out", str(current),
         ])
-        current = remeshed
 
-    # texture always re-runs on the mesh we actually have
+    # Paint the primitive. Views go back into work/ as view_XX.png.
     run([
         blender, "-b", "-P", str(HERE / "texture_pipeline.py"), "--",
         "--mesh", str(current), "--out", str(out),
@@ -100,28 +72,69 @@ def texture_asset(
     ])
     run([
         blender, "-b", "-P", str(HERE / "texture_pipeline.py"), "--",
-        "--mesh", str(current), "--out", str(out),
+        "--mesh", str(current), "--out", str(work / "painted.glb"),
         "--views", str(views), "--res", str(res), "--workdir", str(work), "--bake",
     ])
+    current = work / "painted.glb"
+
+    # Detail from the texture: front view is the alpha source for a card/plane.
+    if displace:
+        alpha_src = work / "view_00.png"
+        cut = work / "cut.glb"
+        run([
+            blender, "-b", "-P", str(HERE / "alpha_to_geometry.py"), "--",
+            "--image", str(alpha_src), "--out", str(cut), "--workdir", str(work),
+        ])
+        current = cut
+
+    if voxel is not None:
+        solid = work / "voxel.glb"
+        run([
+            blender, "-b", "-P", str(HERE / "voxel_remesh.py"), "--",
+            "--mesh", str(current), "--out", str(solid), "--voxel", str(voxel),
+        ])
+        current = solid
+        # topology changed, paint again so the texture matches the new mesh
+        run([
+            blender, "-b", "-P", str(HERE / "texture_pipeline.py"), "--",
+            "--mesh", str(current), "--out", str(out),
+            "--views", str(views), "--res", str(res), "--workdir", str(work),
+        ])
+        run([
+            sys.executable, str(HERE / "openrouter_texture.py"),
+            "--workdir", str(work), "--model", model, "--prompt", prompt,
+        ])
+        run([
+            blender, "-b", "-P", str(HERE / "texture_pipeline.py"), "--",
+            "--mesh", str(current), "--out", str(out),
+            "--views", str(views), "--res", str(res), "--workdir", str(work), "--bake",
+        ])
+    else:
+        # no second topology change; copy the detailed mesh to out if we cut it
+        if current != out:
+            run([
+                blender, "-b", "-P", str(HERE / "texture_pipeline.py"), "--",
+                "--mesh", str(current), "--out", str(out),
+                "--views", str(views), "--res", str(res), "--workdir", str(work), "--bake",
+            ])
 
     if rig:
         run([
             sys.executable, str(HERE / "unirig_rig.py"),
             str(out), "-p", rig, "-o", str(out.with_suffix(".fbx")),
         ])
+    print(f"DONE {out}")
     return out
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="text/image/alpha/mesh -> textured GLB")
+    p = argparse.ArgumentParser()
     p.add_argument("out")
-    p.add_argument("prompt", help="surface description used for the texture pass")
-    src = p.add_mutually_exclusive_group(required=True)
-    src.add_argument("--source-prompt", help="text-to-3D: generate shape from this prompt")
-    src.add_argument("--image", help="image-to-3D")
-    src.add_argument("--alpha", help="alpha mask to silhouette mesh")
-    src.add_argument("--mesh", help="existing mesh, skip shape gen")
-    p.add_argument("--voxel", type=float, default=None, help="voxel size; omit to skip remesh")
+    p.add_argument("prompt")
+    p.add_argument("--mesh", default=None, help="GLB the LLM already wrote")
+    p.add_argument("--primitive", choices=("plane", "cube"), default="plane")
+    p.add_argument("--no-displace", action="store_true")
+    p.add_argument("--voxel", type=float, default=None)
     p.add_argument("--views", type=int, default=6)
     p.add_argument("--res", type=int, default=1024)
     p.add_argument("--model", default="bytedance-seed/seedream-4.5")
@@ -129,17 +142,9 @@ def main() -> None:
     p.add_argument("--workdir", default=None)
     a = p.parse_args()
     texture_asset(
-        a.out,
-        prompt=a.prompt,
-        source_prompt=a.source_prompt,
-        image=a.image,
-        alpha=a.alpha,
-        mesh=a.mesh,
-        voxel=a.voxel,
-        views=a.views,
-        res=a.res,
-        model=a.model,
-        rig=a.rig,
+        a.out, a.prompt,
+        mesh=a.mesh, primitive=a.primitive, views=a.views, res=a.res,
+        model=a.model, displace=not a.no_displace, voxel=a.voxel, rig=a.rig,
         workdir=a.workdir,
     )
 
