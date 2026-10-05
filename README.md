@@ -1,59 +1,86 @@
 # texture-pipeline
 
-Multi-view texture generation pipeline for 3D meshes. Two entry modes:
-
-- **Mesh in** -> orbiting views -> OpenRouter diffusion -> bake -> textured GLB
-- **Alpha image in** -> alpha-to-geometry mesh -> (same texture pipeline)
-
-Designed so an LLM agent (e.g. MiMo-V2.6 via OpenCode) drives everything
-with one function call.
+AI-driven 3D asset pipeline: alpha-to-geometry, multi-view diffusion texturing,
+and optional self-hosted UniRig rigging. Designed so an LLM agent (MiMo-V2.6,
+Claude, etc.) can drive the whole thing through one function call.
 
 ## Pipeline
 
 ```
-alpha image ──> [alpha_to_geometry] ──> mesh ──> [render views] ──> [OpenRouter diffuse] ──> [bake UVs] ──> textured GLB
+alpha mask ──> alpha_to_geometry ──> mesh (GLB)
+                                        │
+                                        ▼
+                              render_views (Blender, N orbiting cams)
+                                        │
+                                        ▼
+                              diffuse_views (OpenRouter: Seedream / Flux / ...)
+                                        │
+                                        ▼
+                              bake_textures (project views onto UV atlas)
+                                        │
+                                        ▼
+                              textured GLB ──> [optional] rig_textured_mesh (UniRig)
+                                                              │
+                                                              ▼
+                                                    Mixamo-spec FBX (Unity/Unreal/iOS ready)
 ```
 
-1. **Alpha-to-geometry** (`alpha_to_geometry.py`) — trace the alpha channel into a subdivided, displaced mesh. Transparent parts get deleted, topology gets re-unwrapped. Optional decimate for mobile budgets.
-2. **Render pass** (`texture_pipeline.py`) — Blender renders N orbiting views, writes `manifest.json`.
-3. **Diffusion pass** (`openrouter_texture.py`) — `POST /api/v1/images` per view with the render as `input_reference`. Default: `bytedance-seed/seedream-4.5`.
-4. **Bake pass** (`texture_pipeline.py --bake`) — project views onto UVs, export GLB.
+## Why this order
 
-## Usage
+Any mesh-changing step destroys rig data — bones, skin weights, animation
+bindings. So rigging is always last, and it's a separate explicit call the
+agent makes after texturing. The agent wrapper enforces this by running
+render → diffuse → bake as a fresh sequence on whatever mesh it receives.
+
+## Files
+
+| File | Role |
+|------|------|
+| `alpha_to_geometry.py` | Alpha-masked image → subdivided, displaced, decimated mesh |
+| `texture_pipeline.py` | Blender render + bake passes |
+| `openrouter_texture.py` | OpenRouter image API (Seedream 4.5 default, swappable) |
+| `unirig_rig.py` | **Self-hosted UniRig rigging** (new) |
+| `ai_texture_agent.py` | One-function agent entry: `texture_mesh()` + `rig_textured_mesh()` |
+
+## Quick start
 
 ```bash
-export OPENROUTER_API_KEY=sk-or-v1-...
-export BLENDER_BIN=blender
+# Texture only
+python ai_texture_agent.py bush_alpha.png "dense forest bush, PBR" bush.glb
 
-# alpha image -> textured GLB (full pipeline)
-python ai_texture_agent.py --image bush.png "dense green foliage, soft studio light" bush_textured.glb
-
-# existing mesh -> textured GLB
-python ai_texture_agent.py --mesh bush.glb "dense green foliage, soft studio light" bush_textured.glb
+# Texture + rig (UniRig must be cloned + weights downloaded)
+python ai_texture_agent.py bush.glb "dense forest bush" bush.glb --rig biped
 ```
 
-## Why the texture must re-run after alpha meshing
+## UniRig setup (optional rigging pass)
 
-Alpha-to-geometry **changes the mesh topology** — new faces, new UVs, different
-triangle layout. A texture baked against the old mesh's UVs will not line up
-with the new ones. So the rule is strict: after any mesh-changing step,
-re-render and re-diffuse from scratch. The agent wrapper enforces this by
-always running render -> diffuse -> bake as a fresh sequence on whatever mesh
-it receives.
+```bash
+git clone https://github.com/VAST-AI-Research/UniRig
+# download weights from https://huggingface.co/VAST-AI/UniRig
+export UNIRIG_ROOT=~/UniRig
+```
 
-## Cost
+UniRig is MIT-licensed, runs on a single consumer GPU (a 3090 is plenty),
+and outputs Mixamo-spec FBX. It handles seven body plans: biped, quadruped,
+hexapod, octopod, avian, serpentine, aquatic. It's nondeterministic, so
+`unirig_rig.py` retries up to 3 times on degenerate skeletons — same pattern
+people use with Tripo's rig endpoint, except retries here cost GPU-seconds,
+not cents.
 
-~6 views x ~$0.01-0.05 = a few cents per asset. The LLM orchestrator never
-touches pixels directly.
+## Cost per asset (textured, 6 views)
 
-## Known limits
+- OpenRouter Seedream 4.5: ~$0.04/image → ~$0.24
+- Blender render/bake: free on owned hardware
+- UniRig rig pass: ~$0.01–0.02 GPU time
+- **Total: roughly 25–30 cents**, vs 60+ cents on Meshy/Tripo for equivalent output
 
-- Bake pass is naive per-triangle rasterization. Seams on complex meshes;
-  swap for xatlas + proper projection in production.
-- Alpha meshing displaces along normals only — no overhangs or true volume.
-  For real 3D volume you'd need voxel remesh / marching cubes (different pass).
-- Requires Blender 4.x and Python 3.10+ with `requests`.
+## Honest limits
 
-## License
-
-MIT
+- Bake pass is naive per-triangle rasterization — expect seams on complex
+  meshes. Swap for xatlas + proper projection for production.
+- Alpha displacement only pushes along normals: puffy silhouette, no true
+  volume or overhangs. For real 3D volume, a voxel remesh / marching-cubes
+  pass is the next step (not yet wired in).
+- UniRig's research-grade CLI means `unirig_rig.py` tries several invocation
+  patterns; if your UniRig version differs, point it at the right script or
+  set up the import path.

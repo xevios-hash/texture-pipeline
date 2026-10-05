@@ -1,98 +1,185 @@
+#!/usr/bin/env python3
+"""ai_texture_agent.py — One-function agent entry point for the full pipeline.
+
+texture_mesh(mesh, prompt, out) drives: alpha-to-geometry -> render -> diffuse
+-> bake, and optionally rigs the result with self-hosted UniRig.
+
+The LLM (MiMo-V2.6, Claude, whatever) is the orchestrator: it picks prompts,
+models, and retry policy. This module never touches pixels directly — it
+shells out to Blender for geometry/render/bake and calls OpenRouter for
+diffusion. Rigging is a separate optional pass because any mesh-changing step
+destroys rig data, so it must come last.
+
+Usage:
+    from ai_texture_agent import texture_mesh, rig_textured_mesh
+
+    glb = texture_mesh("bush_alpha.png", "dense forest bush, PBR", "bush.glb")
+    rigged = rig_textured_mesh(glb, body_plan="biped")   # optional
 """
-ai_texture_agent.py  --  the piece an LLM agent calls.
 
-One function: texture_mesh(mesh_path, prompt, out_path, **opts)
+from __future__ import annotations
 
-Full pipeline (alpha image in -> textured GLB out):
-  1. alpha_to_geometry.py  --image in.png --out mesh.glb   (if --image given)
-  2. texture_pipeline.py   render pass  (orbiting views + manifest.json)
-  3. openrouter_texture.py diffusion pass (per-view OpenRouter Image API)
-  4. texture_pipeline.py   --bake       (project views onto UVs, export GLB)
+import argparse
+import subprocess
+import sys
+from pathlib import Path
+from typing import Optional
 
-Because step 1 changes mesh topology, steps 2-4 ALWAYS re-run from scratch
-on the new mesh.  Never reuse a texture baked for a previous mesh version.
-
-Example agent call:
-    texture_mesh(image="bush.png", prompt="dense green foliage, soft studio light",
-                 out="bush_textured.glb")
-    # or skip alpha meshing if you already have a mesh:
-    texture_mesh(mesh="bush.glb", prompt="...", out="bush_textured.glb")
-"""
-import argparse, os, subprocess, sys
-
-BLENDER = os.environ.get("BLENDER_BIN", "blender")
-HERE = os.path.dirname(os.path.abspath(__file__))
+from alpha_to_geometry import alpha_to_mesh
+from openrouter_texture import diffuse_views
+from texture_pipeline import bake_textures, render_views
 
 
-def run(cmd):
-    print("+", " ".join(cmd), flush=True)
-    subprocess.run(cmd, check=True)
+# ---------------------------------------------------------------------------
+# Pipeline stages
+# ---------------------------------------------------------------------------
 
+def texture_mesh(
+    mesh: str | Path,
+    prompt: str,
+    out: str | Path = "textured.glb",
+    *,
+    alpha_mask: Optional[str | Path] = None,
+    views: int = 6,
+    model: str = "bytedance-seed/seedream-4.5",
+    api_key: Optional[str] = None,
+    blender: str = "blender",
+    work_dir: Optional[str | Path] = None,
+) -> Path:
+    """Full texture pipeline for one asset.
 
-def texture_mesh(mesh=None, image=None, prompt=None, out=None,
-                 workdir=None, views=6, res=1024,
-                 model="bytedance-seed/seedream-4.5", blender=BLENDER,
-                 alpha_threshold=0.5, alpha_subdiv=6, alpha_decimate=0.05):
-    """Alpha image (or existing mesh) -> textured GLB.
+    1. If alpha_mask is given, run alpha-to-geometry first — the mesh gets
+       created/defined from the masked image before anything else.
+    2. Render orbiting views (transparent BG).
+    3. Diffuse each view via OpenRouter (Seedream default, swappable).
+    4. Bake projected views back onto the UV atlas.
 
-    If `image` is given, step 1 meshes it via alpha_to_geometry.py and the
-    resulting mesh becomes the input to steps 2-4.  `mesh` is ignored then.
+    Because alpha meshing changes topology, any texture baked against old UVs
+    won't line up — so the render/diffuse/bake sequence always runs fresh on
+    whatever mesh it receives. Never reuse a prior bake.
+
+    Parameters
+    ----------
+    mesh : input mesh, or ignored if alpha_mask is provided
+    prompt : text prompt for the diffusion pass
+    out : final GLB path
+    alpha_mask : optional masked image -> alpha-to-geometry pre-pass
+    views : number of orbiting cameras
+    model : OpenRouter image model id
+    api_key : OpenRouter key (falls back to OPENROUTER_API_KEY env)
+    blender : Blender executable
+    work_dir : scratch directory for intermediates
+
+    Returns
+    -------
+    Path to the textured GLB.
     """
-    if out is None:
-        raise ValueError("out path required")
-    if prompt is None:
-        raise ValueError("prompt required")
+    out = Path(out)
+    work = Path(work_dir) if work_dir else out.parent / f".{out.stem}_work"
+    work.mkdir(parents=True, exist_ok=True)
 
-    workdir = workdir or os.path.join(os.path.dirname(os.path.abspath(out)),
-                                      "_tex_" + os.path.splitext(os.path.basename(out))[0])
-    os.makedirs(workdir, exist_ok=True)
+    # Stage 0: alpha-to-geometry (mesh gets created and defined here)
+    current_mesh = Path(mesh)
+    if alpha_mask is not None:
+        current_mesh = alpha_to_mesh(
+            alpha_mask,
+            out=work / f"{out.stem}_alpha.glb",
+            blender=blender,
+        )
+        print(f"[agent] alpha mesh: {current_mesh}")
 
-    # ---- step 1: alpha -> mesh (optional) ----
-    if image:
-        mesh_path = os.path.join(workdir, "alpha_mesh.glb")
-        run([blender, "-b", "-P", os.path.join(HERE, "alpha_to_geometry.py"), "--",
-             "--image", image, "--out", mesh_path,
-             "--threshold", str(alpha_threshold),
-             "--subdiv", str(alpha_subdiv),
-             "--decimate", str(alpha_decimate),
-             "--workdir", workdir])
-        mesh = mesh_path
-    elif mesh is None:
-        raise ValueError("either mesh or image required")
+    # Stage 1: render views
+    manifest = render_views(current_mesh, work / "views", n_views=views, blender=blender)
+    print(f"[agent] rendered {views} views -> {manifest}")
 
-    # ---- step 2: render orbiting views ----
-    # IMPORTANT: always re-render.  If step 1 changed the topology, any
-    # previously baked texture is invalid for this mesh.
-    run([blender, "-b", "-P", os.path.join(HERE, "texture_pipeline.py"), "--",
-         "--mesh", mesh, "--out", out, "--views", str(views), "--res", str(res),
-         "--workdir", workdir])
+    # Stage 2: diffuse
+    diffused = diffuse_views(manifest, prompt, work / "diffused", model=model, api_key=api_key)
+    print(f"[agent] diffused {len(diffused)} views")
 
-    # ---- step 3: OpenRouter diffusion per view ----
-    run([sys.executable, os.path.join(HERE, "openrouter_texture.py"),
-         "--workdir", workdir, "--model", model, "--prompt", prompt])
-
-    # ---- step 4: bake projected views onto UVs + export GLB ----
-    run([blender, "-b", "-P", os.path.join(HERE, "texture_pipeline.py"), "--",
-         "--mesh", mesh, "--out", out, "--views", str(views), "--res", str(res),
-         "--workdir", workdir, "--bake"])
+    # Stage 3: bake
+    bake_textures(current_mesh, diffused, manifest, out, blender=blender)
+    print(f"[agent] baked -> {out}")
     return out
 
 
+def rig_textured_mesh(
+    mesh: str | Path,
+    *,
+    body_plan: str = "biped",
+    out: Optional[str | Path] = None,
+    max_attempts: int = 3,
+    unirig_root: Optional[str | Path] = None,
+):
+    """Optional post-texture rigging pass via self-hosted UniRig.
+
+    Must run AFTER texturing: any mesh-changing step destroys bones, skin
+    weights, and animation bindings. This is why rigging is a separate
+    function the agent calls explicitly rather than being baked into
+    texture_mesh().
+
+    Lazy-imports unirig_rig so the texture pipeline works without UniRig
+    installed — rigging is opt-in.
+    """
+    from unirig_rig import rig_mesh
+
+    mesh = Path(mesh)
+    out = Path(out) if out else mesh.with_name(f"{mesh.stem}_rigged.fbx")
+    result = rig_mesh(
+        mesh,
+        body_plan=body_plan,
+        out=out,
+        max_attempts=max_attempts,
+        unirig_root=unirig_root,
+    )
+    tag = "DEGENERATE" if result.degenerate else "OK"
+    print(
+        f"[agent] rig [{tag}] {result.fbx_path} | {result.skeleton_joints} joints | "
+        f"{result.body_plan} | attempt {result.attempt}/{max_attempts}"
+    )
+    return result
+
+
+# ---------------------------------------------------------------------------
+# CLI: agent-style one-shot
+    #   python ai_texture_agent.py bush_alpha.png "dense forest bush" bush.glb
+    #   python ai_texture_agent.py bush.glb "dense forest bush" bush.glb --rig biped
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    p = argparse.ArgumentParser(description="Agent entry point: texture (+ optional rig)")
+    p.add_argument("mesh", help="Input mesh, or alpha-masked image if --alpha given")
+    p.add_argument("prompt", help="Diffusion prompt")
+    p.add_argument("out", help="Output GLB path")
+    p.add_argument("--alpha", help="Alpha mask image -> alpha-to-geometry pre-pass")
+    p.add_argument("--views", type=int, default=6)
+    p.add_argument("--model", default="bytedance-seed/seedream-4.5")
+    p.add_argument("--rig", choices=["biped", "quadruped", "hexapod", "octopod", "avian", "serpentine", "aquatic"],
+                   help="Optional UniRig pass after texturing")
+    p.add_argument("--rig-attempts", type=int, default=3)
+    p.add_argument("--unirig-root", default=None)
+    p.add_argument("--blender", default="blender")
+    p.add_argument("--work-dir", default=None)
+    args = p.parse_args()
+
+    glb = texture_mesh(
+        args.mesh,
+        args.prompt,
+        args.out,
+        alpha_mask=args.alpha,
+        views=args.views,
+        model=args.model,
+        blender=args.blender,
+        work_dir=args.work_dir,
+    )
+
+    if args.rig:
+        rig_textured_mesh(
+            glb,
+            body_plan=args.rig,
+            max_attempts=args.rig_attempts,
+            unirig_root=args.unirig_root,
+        )
+
+
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--mesh", default=None, help="existing mesh (skip alpha step)")
-    ap.add_argument("--image", default=None, help="alpha-masked image to mesh first")
-    ap.add_argument("prompt", help="surface description for the diffusion pass")
-    ap.add_argument("out", help="output textured GLB")
-    ap.add_argument("--views", type=int, default=6)
-    ap.add_argument("--res", type=int, default=1024)
-    ap.add_argument("--model", default="bytedance-seed/seedream-4.5")
-    ap.add_argument("--workdir", default=None)
-    ap.add_argument("--alpha-threshold", type=float, default=0.5)
-    ap.add_argument("--alpha-subdiv", type=int, default=6)
-    ap.add_argument("--alpha-decimate", type=float, default=0.05)
-    a = ap.parse_args()
-    texture_mesh(mesh=a.mesh, image=a.image, prompt=a.prompt, out=a.out,
-                 workdir=a.workdir, views=a.views, res=a.res, model=a.model,
-                 alpha_threshold=a.alpha_threshold, alpha_subdiv=a.alpha_subdiv,
-                 alpha_decimate=a.alpha_decimate)
+    main()
