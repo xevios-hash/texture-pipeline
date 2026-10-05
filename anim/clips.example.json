@@ -1,0 +1,20 @@
+{
+  "asset": "assets/crate.glb",
+  "out": "assets/crate_anim.glb",
+  "actions": [
+    {
+      "name": "lid_open",
+      "object": "lid",
+      "channel": "rotation_euler",
+      "axis": 0,
+      "keys": [[0.0, 0.0], [0.4, -1.2]]
+    },
+    {
+      "name": "spin",
+      "object": "wheel",
+      "channel": "rotation_euler",
+      "axis": 1,
+      "keys": [[0.0, 0.0], [1.0, 6.283]]
+    }
+  ]
+}

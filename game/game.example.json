@@ -1,0 +1,7 @@
+{
+  "world": "worlds/clearing.glb",
+  "spawn": [0, 0, 0],
+  "player": "assets/hero_walk.glb",
+  "clips": {"idle": "idle", "walk": "walk"},
+  "move_speed": 4.0
+}

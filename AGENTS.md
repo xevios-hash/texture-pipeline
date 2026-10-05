@@ -1,43 +1,40 @@
 # OpenCode instructions
 
-This repo is a texture pipeline, not a 3D generator. Do not call Meshy, Tripo, Hunyuan, or shape_gen.py.
+Read LAYERS.md. Do not collapse the layers. Do not call Meshy, Tripo, or Hunyuan.
 
-## What to run
+## Mesh
 
-One command. Do not reimplement the steps.
+macOS: `./run_pipeline.sh bush.glb "dense green bush, cutout foliage" --primitive plane`
+Windows: `run_pipeline.bat bush.glb "dense green bush, cutout foliage" --primitive plane`
 
-macOS:
+`--no-displace` keeps a cube a cube. `--voxel` only if asked.
+
+## Parts and clips
+
+Prop motion is `anim/clips.json` then:
 
 ```bash
-./run_pipeline.sh <out.glb> "<surface prompt>" --primitive plane
+blender -b -P anim/prop_actions.py -- --spec anim/clips.json
 ```
 
-Windows:
+Character motion is a Mixamo FBX you already downloaded, retargeted by bone name:
 
-```bat
-run_pipeline.bat <out.glb> "<surface prompt>" --primitive plane
+```bash
+blender -b -P anim/retarget_mixamo.py -- --mesh hero.fbx --clip clips/walk.fbx --out assets/hero_walk.glb --name walk
 ```
 
-Flags:
+Do not invent a walk cycle. If clips/ is empty, say so.
 
-- `--primitive plane` for foliage, sprites, cards. Default.
-- `--primitive cube` for boxes. Add `--no-displace` if the silhouette should stay a cube.
-- `--mesh path.glb` if you already wrote a GLB. Skip `--primitive` in that case.
-- `--voxel 0.03` only if the user asked for a closed volume. It spends the image budget twice.
-- `--model` only if the user names an OpenRouter image model. Default is `bytedance-seed/seedream-4.5`.
+## World
 
-## Required environment
+Edit `worlds/<name>.json` (copy `env/world.example.json`). Then rebuild. Never move props by regenerating meshes.
 
-- `OPENROUTER_API_KEY` must already be set. Do not ask the user to paste it into a file. Do not echo it.
-- `BLENDER_BIN` if `blender` is not on PATH. macOS default is `/Applications/Blender.app/Contents/MacOS/Blender`.
+```bash
+blender -b -P env/build_world.py -- --spec worlds/clearing.json --out worlds/clearing.glb
+```
 
-## Order, if you have to debug a single stage
+## Game
 
-1. `primitive_mesh.py` writes the GLB.
-2. `texture_pipeline.py` renders views.
-3. `openrouter_texture.py` paints them.
-4. `texture_pipeline.py --bake` writes the GLB.
-5. `alpha_to_geometry.py` cuts the silhouette from the paint.
-6. `voxel_remesh.py` only if requested, then bake again.
+Copy the world GLB and `game/game.example.json` into `game/` as `game.json`. Open `game/` in Godot 4. Gameplay changes go in `game/main.gd`, not in the mesh scripts.
 
-Rigging is out of scope unless the user asks.
+`OPENROUTER_API_KEY` must already be set. Do not print it.
