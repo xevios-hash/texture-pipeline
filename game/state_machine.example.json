@@ -1,0 +1,38 @@
+{
+  "start": "idle",
+  "states": {
+    "idle": {
+      "clip": "idle",
+      "transitions": [
+        {"to": "walk", "when": "speed > 0.1"},
+        {"to": "attack", "when": "attack_pressed"}
+      ]
+    },
+    "walk": {
+      "clip": "walk",
+      "transitions": [
+        {"to": "idle", "when": "speed <= 0.1"},
+        {"to": "attack", "when": "attack_pressed"},
+        {"to": "run", "when": "sprint_pressed"}
+      ]
+    },
+    "run": {
+      "clip": "run",
+      "transitions": [
+        {"to": "walk", "when": "not sprint_pressed"}
+      ]
+    },
+    "attack": {
+      "clip": "attack",
+      "lock": true,
+      "transitions": [
+        {"to": "idle", "when": "clip_finished"}
+      ]
+    },
+    "dead": {
+      "clip": "death",
+      "lock": true,
+      "transitions": []
+    }
+  }
+}

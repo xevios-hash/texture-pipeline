@@ -1,0 +1,9 @@
+{
+  "health": 3,
+  "win_when": "player_at_goal",
+  "fail_when": "health <= 0",
+  "on_win": "restart",
+  "on_fail": "restart",
+  "goal": [10, 0, 10],
+  "goal_radius": 1.5
+}

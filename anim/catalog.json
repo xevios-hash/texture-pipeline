@@ -1,0 +1,40 @@
+{
+  "note": "Direct urls are fetched. Mixamo rows need a logged-in browser; the script will not pretend otherwise.",
+  "clips": [
+    {
+      "intent": ["idle", "stand", "breathe"],
+      "name": "idle",
+      "source": "mixamo",
+      "search": "Idle",
+      "url": null
+    },
+    {
+      "intent": ["walk", "locomotion"],
+      "name": "walk",
+      "source": "mixamo",
+      "search": "Walking",
+      "url": null
+    },
+    {
+      "intent": ["run", "sprint"],
+      "name": "run",
+      "source": "mixamo",
+      "search": "Running",
+      "url": null
+    },
+    {
+      "intent": ["attack", "punch", "hit", "slash"],
+      "name": "attack",
+      "source": "mixamo",
+      "search": "Punching",
+      "url": null
+    },
+    {
+      "intent": ["death", "die"],
+      "name": "death",
+      "source": "mixamo",
+      "search": "Dying",
+      "url": null
+    }
+  ]
+}
