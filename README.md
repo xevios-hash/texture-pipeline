@@ -1,57 +1,44 @@
 # texture-pipeline
 
-Multi-view texture generation pipeline for 3D meshes. Renders orbiting views of a mesh in Blender, textures each view through the OpenRouter Image API, then bakes the results back onto the mesh UVs and exports a GLB.
+End-to-end asset pipeline: **alpha image -> mesh -> textured GLB**.
 
-Designed so an LLM agent (e.g. MiMo-V2.6 via OpenCode) can drive the whole thing with one function call.
+Four passes, driven by one agent-facing function:
 
-## Pipeline
-
-1. **Render pass** (`texture_pipeline.py`) — Blender renders N orbiting views with transparent backgrounds, writes `manifest.json` describing each camera.
-2. **Diffusion pass** (`openrouter_texture.py`) — calls `POST https://openrouter.ai/api/v1/images` per view, sending the rendered view as an `input_reference` so the model edits in place. Default model: `bytedance-seed/seedream-4.5` (~$0.01/image). Swappable to `black-forest-labs/flux.2-pro` or `google/gemini-3.1-flash-image`.
-3. **Bake pass** (`texture_pipeline.py --bake`) — projects each view onto the UV atlas (per-triangle, most face-on camera wins), assigns the atlas to a Principled BSDF, exports GLB.
+1. **alpha_to_geometry.py** — traces the alpha channel of an image into a mesh (plane mode: subdivide + delete low-alpha faces; sprite mode: connected components, one mesh per blob). Decimates to a target triangle budget.
+2. **texture_pipeline.py** — Blender renders N orbiting views with transparent backgrounds, writes `manifest.json`.
+3. **openrouter_texture.py** — calls `POST https://openrouter.ai/api/v1/images` per view, sending each rendered view as an `input_reference` so the diffusion model edits in place. Default: `bytedance-seed/seedream-4.5` (~$0.01/image). Swappable to Flux 2 Pro or Nano Banana 2.
+4. **texture_pipeline.py --bake** — projects each diffused view onto the UV atlas (per-triangle, most face-on camera wins), assigns to a Principled BSDF, exports GLB.
 
 ## Usage
 
 ```bash
 export OPENROUTER_API_KEY=sk-or-v1-...
-export BLENDER_BIN=blender   # optional, defaults to 'blender' on PATH
+export BLENDER_BIN=blender   # optional
 
-python ai_texture_agent.py bush.glb "dense green foliage, soft studio light" bush_textured.glb
-```
+# full pipeline: alpha image -> textured GLB
+python ai_texture_agent.py bush.png "dense green foliage, soft studio light" bush_textured.glb
 
-Or step by step:
-
-```bash
-# 1. render views
-blender -b -P texture_pipeline.py -- --mesh bush.glb --out bush_textured.glb --views 6 --res 1024 --workdir ./work
-
-# 2. diffuse each view
-python openrouter_texture.py --workdir ./work --prompt "dense green foliage, soft studio light, no background"
-
-# 3. bake + export
-blender -b -P texture_pipeline.py -- --mesh bush.glb --out bush_textured.glb --workdir ./work --bake
+# or just the alpha->mesh pre-pass
+blender -b -P alpha_to_geometry.py -- --image bush.png --out bush.glb --mode plane --subdiv 8 --decimate 0.05
 ```
 
 ## Agent wrapper
 
-`ai_texture_agent.py` exposes one function:
-
 ```python
-from ai_texture_agent import texture_mesh
-texture_mesh("bush.glb", "dense green foliage, soft studio light", "bush_textured.glb")
+from ai_texture_agent import texture_asset
+texture_asset("bush.png", "dense green foliage, soft studio light", "bush_textured.glb")
 ```
-
-The agent never sees Blender internals — just mesh in, textured GLB out.
 
 ## Cost
 
-~6 views × ~$0.01–0.05 = a few cents per asset. MiMo-V2.6 (or any model) stays the orchestrator; it never touches pixels directly.
+~6 views x ~$0.01-0.05 = a few cents per asset. The LLM orchestrator (MiMo-V2.6, Claude, etc.) never touches pixels directly.
 
-## Notes / known limits
+## Known limits
 
-- The bake pass is naive per-triangle rasterization, not a GPU rasterizer. Seams and aliasing will show on complex meshes. For production, swap for xatlas + a proper projection step.
-- Requires Blender 4.x with EEVEE (or EEVEE_NEXT) and Python 3.10+ with `requests`.
-- Output is a standard GLB with a PBR albedo map — RealityKit / SceneKit on iOS can load it directly.
+- The bake pass is naive per-triangle rasterization. Seams and aliasing will show on complex meshes; for production swap for xatlas + a proper projection step.
+- Plane mode produces flat cards — displacement or a later remesh pass is needed for true 3D volume (leaves, bark).
+- Sprite mode needs clean separation between blobs; overlapping alpha will merge them.
+- Output is a standard GLB with a PBR albedo map — RealityKit / SceneKit on iOS load it directly.
 
 ## License
 
