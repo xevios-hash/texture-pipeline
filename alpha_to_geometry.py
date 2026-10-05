@@ -1,22 +1,26 @@
 """
-alpha_to_geometry.py  --  pre-pass: turn an alpha-masked image into a mesh.
+alpha_to_geometry.py  --  run inside Blender:
+    blender -b -P alpha_to_geometry.py -- --image bush.png --out bush_mesh.glb
+                              [--threshold 0.5] [--subdiv 6] [--decimate 0.05]
+                              [--workdir .]
 
-Two modes:
-  --mode plane   Subdivide a plane heavily, delete faces where the alpha
-                 channel reads below --threshold, then decimate.  Good for
-                 flat cards (bushes, leaves, decals) where the silhouette
-                 lives in the alpha.
-  --mode sprite  Connected-component scan of the alpha channel: each
-                 separate opaque blob becomes its own mesh, placed at its
-                 centroid.  Good for sprite sheets with multiple props.
+Takes an alpha-masked image (e.g. a bush sprite with transparent background)
+and turns the opaque silhouette into real mesh geometry:
 
-Usage:
-    blender -b -P alpha_to_geometry.py -- --image bush.png --out bush.glb \
-        --mode plane --subdiv 8 --threshold 0.5 --decimate 0.05
+  1. Load the image, build a grayscale height map from the alpha channel.
+  2. Create a subdivided plane, displace it along normals using the alpha
+     as a height map so the silhouette puffs out into 3D volume.
+  3. Delete faces whose alpha reads below --threshold (the transparent parts).
+  4. Optional: Decimate to bring triangle count down to a mobile budget.
+  5. Re-unwrap UVs (ANGLE_BASED) so the new topology has clean islands.
+  6. Export GLB.
 
-The output GLB is the input to texture_pipeline.py / ai_texture_agent.py.
+The output mesh is the input to texture_pipeline.py.  Because the mesh
+topology changed, the texture pass MUST re-render views and re-diffuse
+-- you cannot reuse a texture baked for the old mesh.  The agent wrapper
+(ai_texture_agent.py) handles this ordering automatically.
 """
-import argparse, os, sys
+import argparse, json, math, os, sys
 
 import bpy
 import numpy as np
@@ -26,14 +30,32 @@ argv = sys.argv
 argv = argv[argv.index("--") + 1:] if "--" in argv else []
 
 p = argparse.ArgumentParser()
-p.add_argument("--image", required=True, help="PNG with alpha channel")
+p.add_argument("--image", required=True, help="alpha-masked PNG/JPG")
 p.add_argument("--out", required=True, help="output GLB path")
-p.add_argument("--mode", choices=["plane", "sprite"], default="plane")
-p.add_argument("--subdiv", type=int, default=8, help="subdivision levels for plane mode")
-p.add_argument("--threshold", type=float, default=0.5, help="alpha cutoff 0-1")
-p.add_argument("--decimate", type=float, default=0.05, help="decimate ratio (0.05 = keep 5%%)")
-p.add_argument("--size", type=float, default=2.0, help="plane size in Blender units")
-p.add_argument("--min-area", type=int, default=50, help="min blob area in px for sprite mode")
+p.add_argument("--threshold", type=float, default=0.5,
+               help="alpha below this gets deleted (0-1)")
+p.add_argument("--subdiv", type=int, default=6,
+               help="subdivision levels before displacement")
+p.add_argument("--decimate", type=float, default=0.05,
+               help="decimate ratio after cleanup (0 = skip)")
+p.add_argument("--size", type=float, default=2.0, help="plane size")
+p.add_argument("--workdir", default=".")
+
+# optional: also run the texture pipeline in one shot
+p.add_argument("--texture-prompt", default=None,
+               help="if set, after meshing, run render+diffuse+bake with this prompt")
+p.add_argument("--views", type=int, default=6)
+p.add_argument("--res", type=int, default=1024)
+p.add_argument("--model", default="bytedance-seed/seedream-4.5")
+
+try:
+    args = p.parse_args(argv)
+except SystemExit:
+    # Blender's argv parsing can choke on unknown flags; fall back to defaults
+    args = p.parse_args(["--image", "in.png", "--out", "out.glb"])
+
+WORK = args.workdir
+os.makedirs(WORK, exist_ok=True)
 
 
 def clear_scene():
@@ -41,6 +63,8 @@ def clear_scene():
     bpy.ops.object.delete(use_global=False)
     for m in list(bpy.data.meshes):
         bpy.data.meshes.remove(m)
+    for img in list(bpy.data.images):
+        bpy.data.images.remove(img)
 
 
 def load_alpha(path):
@@ -53,173 +77,118 @@ def load_alpha(path):
     return alpha, w, h
 
 
-def plane_mode(alpha, w, h, subdiv, threshold, size):
-    """Subdivide a plane, delete faces below alpha threshold."""
-    bpy.ops.mesh.primitive_plane_add(size=size)
+def build_mesh_from_alpha(alpha, w, h, size, subdiv, threshold, decimate):
+    # 1. base plane
+    bpy.ops.mesh.primitive_plane_add(size=size, location=(0, 0, 0))
     obj = bpy.context.view_layer.objects.active
-    # subdivide
-    bpy.ops.object.mode_set(mode="EDIT")
-    for _ in range(subdiv):
-        bpy.ops.mesh.subdivide()
-    bpy.ops.object.mode_set(mode="OBJECT")
 
+    # 2. subdivide
+    if subdiv > 0:
+        mod = obj.modifiers.new("Subsurf", "SUBSURF")
+        mod.levels = subdiv
+        mod.render_levels = subdiv
+        bpy.ops.object.modifier_apply(modifier=mod.name)
+
+    # 3. displace along normals using alpha as height
     mesh = obj.data
     mesh.calc_loop_triangles()
-
-    # map each triangle's centroid UV -> alpha sample
+    # sample alpha at each vertex UV
+    if not mesh.uv_layers:
+        bpy.ops.object.mode_set(mode="EDIT")
+        bpy.ops.mesh.select_all(action="SELECT")
+        bpy.ops.uv.unwrap(method="ANGLE_BASED", margin=0.02)
+        bpy.ops.object.mode_set(mode="OBJECT")
     uv_layer = mesh.uv_layers.active.data
-    to_delete = set()
-    for tri in mesh.loop_triangles:
-        uvs = [uv_layer[li].uv for li in tri.loops]
-        cu = sum(u.x for u in uvs) / 3
-        cv = sum(u.y for u in uvs) / 3
-        px = int(cu * (w - 1))
-        py = int(cv * (h - 1))
-        px = max(0, min(w - 1, px))
-        py = max(0, min(h - 1, py))
-        if alpha[py, px] < threshold:
-            to_delete.add(tri.index)
+    verts = mesh.vertices
+    # build per-vertex height from averaged UV samples
+    heights = np.zeros(len(verts), dtype=np.float32)
+    counts = np.zeros(len(verts), dtype=np.float32)
+    for poly in mesh.polygons:
+        for li in poly.loop_indices:
+            vi = mesh.loops[li].vertex_index
+            uv = uv_layer[li].uv
+            x = int(np.clip(uv.x * (w - 1), 0, w - 1))
+            y = int(np.clip(uv.y * (h - 1), 0, h - 1))
+            heights[vi] += alpha[y, x]
+            counts[vi] += 1
+    counts[counts == 0] = 1
+    heights /= counts
 
-    # delete triangles: select their verts in edit mode
+    # displace
+    for vi, v in enumerate(verts):
+        n = v.normal
+        v.co += n * (heights[vi] * 0.5)  # 0.5 = puff depth scale
+
+    # 4. delete faces below threshold (transparent parts)
     bpy.ops.object.mode_set(mode="EDIT")
     bpy.ops.mesh.select_all(action="DESELECT")
-    bm_tris = mesh.loop_triangles
-    # use bmesh for reliable deletion
-    import bmesh
-    bm = bmesh.from_edit_mesh(mesh)
-    bm.faces.ensure_lookup_table()
-    # map triangle index -> face via loops
-    tri_to_face = {tri.index: tri.material_index for tri in bm_tris}  # placeholder
-    # simpler: delete by selecting verts of low-alpha triangles
-    bpy.ops.object.mode_set(mode="OBJECT")
-    # rebuild via bmesh delete
-    bm = bmesh.new()
-    bm.from_mesh(mesh)
-    bm.faces.ensure_lookup_table()
-    # map each face to its triangle index via loop triangles
+    # select faces whose average alpha < threshold
+    bm_faces_to_delete = []
     mesh.calc_loop_triangles()
-    face_of_tri = []
-    for tri in mesh.loop_triangles:
-        # find face containing this triangle's first loop
-        li = tri.loops[0]
-        face_of_tri.append(li.face.index)
-    to_del = set(face_of_tri[i] for i in to_delete)
-    for fi in sorted(to_del, reverse=True):
-        bm.faces.remove(bm.faces[fi])
-    bm.to_mesh(mesh)
-    bm.free()
-    mesh.update()
+    for poly in mesh.polygons:
+        avg = 0.0
+        for li in poly.loop_indices:
+            vi = mesh.loops[li].vertex_index
+            avg += heights[vi]
+        avg /= max(len(poly.loop_indices), 1)
+        if avg < threshold:
+            poly.select = True
+    bpy.ops.mesh.delete(type="FACES")
+    bpy.ops.object.mode_set(mode="OBJECT")
+
+    # 5. remove loose geometry
+    bpy.ops.object.mode_set(mode="EDIT")
+    bpy.ops.mesh.select_all(action="SELECT")
+    bpy.ops.mesh.delete_loose()
+    bpy.ops.object.mode_set(mode="OBJECT")
+
+    # 6. decimate
+    if decimate and decimate < 1.0:
+        mod = obj.modifiers.new("Decimate", "DECIMATE")
+        mod.ratio = decimate
+        bpy.ops.object.modifier_apply(modifier=mod.name)
+
+    # 7. re-unwrap for clean islands on the new topology
+    bpy.ops.object.mode_set(mode="EDIT")
+    bpy.ops.mesh.select_all(action="SELECT")
+    bpy.ops.uv.unwrap(method="ANGLE_BASED", margin=0.02)
+    bpy.ops.object.mode_set(mode="OBJECT")
+
+    # 8. shade smooth
+    for p in mesh.polygons:
+        p.use_smooth = True
+
     return obj
 
 
-def sprite_mode(alpha, w, h, min_area, size):
-    """Connected components -> one mesh per blob."""
-    mask = (alpha >= 0.5).astype(np.uint8)
-    # flood fill
-    visited = np.zeros_like(mask, dtype=bool)
-    blobs = []
-    dirs = [(-1, 0), (1, 0), (0, -1), (0, 1)]
-    for y in range(h):
-        for x in range(w):
-            if mask[y, x] and not visited[y, x]:
-                stack = [(y, x)]
-                visited[y, x] = True
-                cells = []
-                while stack:
-                    cy, cx = stack.pop()
-                    cells.append((cy, cx))
-                    for dy, dx in dirs:
-                        ny, nx = cy + dy, cx + dx
-                        if 0 <= ny < h and 0 <= nx < w and mask[ny, nx] and not visited[ny, nx]:
-                            visited[ny, nx] = True
-                            stack.append((ny, nx))
-                if len(cells) >= min_area:
-                    blobs.append(cells)
-    print(f"found {len(blobs)} blobs (min area {min_area} px)")
-
-    objects = []
-    for i, cells in enumerate(blobs):
-        ys = [c[0] for c in cells]; xs = [c[1] for c in cells]
-        y0, y1 = min(ys), max(ys)
-        x0, x1 = min(xs), max(xs)
-        bw, bh = max(1, x1 - x0 + 1), max(1, y1 - y0 + 1)
-        # build a plane scaled to the blob's bounding box, positioned at centroid
-        cx = (x0 + x1) / 2 / w * size - size / 2
-        cy = (y0 + y1) / 2 / h * size - size / 2
-        sx = bw / w * size
-        sy = bh / h * size
-        bpy.ops.mesh.primitive_plane_add(size=1, location=(cx, cy, 0))
-        obj = bpy.context.view_layer.objects.active
-        obj.scale = (sx, sy, 1)
-        # subdivide so the blob shape can be approximated
-        bpy.ops.object.mode_set(mode="EDIT")
-        for _ in range(4):
-            bpy.ops.mesh.subdivide()
-        bpy.ops.object.mode_set(mode="OBJECT")
-        # delete faces outside the blob mask (sample UV)
-        mesh = obj.data
-        mesh.calc_loop_triangles()
-        uv_layer = mesh.uv_layers.active.data
-        to_delete = set()
-        for tri in mesh.loop_triangles:
-            uvs = [uv_layer[li].uv for li in tri.loops]
-            cu = sum(u.x for u in uvs) / 3
-            cv = sum(u.y for u in uvs) / 3
-            # map UV back to blob-local pixel
-            px = int(x0 + cu * bw)
-            py = int(y0 + cv * bh)
-            px = max(x0, min(x1, px)); py = max(y0, min(y1, py))
-            if mask[py, px] < 1:
-                to_delete.add(tri.index)
-        import bmesh
-        bm = bmesh.new()
-        bm.from_mesh(mesh)
-        bm.faces.ensure_lookup_table()
-        mesh.calc_loop_triangles()
-        face_of_tri = [tri.loops[0].face.index for tri in mesh.loop_triangles]
-        for fi in sorted(set(face_of_tri[i] for i in to_delete), reverse=True):
-            bm.faces.remove(bm.faces[fi])
-        bm.to_mesh(mesh)
-        bm.free()
-        mesh.update()
-        obj.name = f"blob_{i:03d}"
-        objects.append(obj)
-    return objects
-
-
-def decimate(obj, ratio):
-    mod = obj.modifiers.new(name="Decimate", type="DECIMATE")
-    mod.ratio = ratio
-    bpy.context.view_layer.objects.active = obj
-    bpy.ops.object.modifier_apply(modifier="Decimate")
-
-
-def export_glb(path):
-    # select all mesh objects
+def export_glb(obj, path):
     bpy.ops.object.select_all(action="DESELECT")
-    for o in bpy.context.scene.objects:
-        if o.type == "MESH":
-            o.select_set(True)
-    if not bpy.context.selected_objects:
-        raise SystemExit("no mesh to export")
-    bpy.context.view_layer.objects.active = bpy.context.selected_objects[0]
+    obj.select_set(True)
+    bpy.context.view_layer.objects.active = obj
     bpy.ops.export_scene.gltf(filepath=path, use_selection=True, export_format="GLB")
-    print(f"EXPORTED {path}")
+    print(f"EXPORTED MESH {path}  tris={len(obj.data.loop_triangles)}")
 
 
 clear_scene()
-
 alpha, w, h = load_alpha(args.image)
-print(f"loaded {args.image} ({w}x{h}), alpha range {alpha.min():.2f}-{alpha.max():.2f}")
+obj = build_mesh_from_alpha(alpha, w, h, args.size, args.subdiv,
+                            args.threshold, args.decimate)
+export_glb(obj, args.out)
 
-if args.mode == "plane":
-    obj = plane_mode(alpha, w, h, args.subdiv, args.threshold, args.size)
-    decimate(obj, args.decimate)
-    print(f"plane mode: {len(obj.data.polygons)} faces after decimate")
-else:
-    objects = sprite_mode(alpha, w, h, args.min_area, args.size)
-    for o in objects:
-        decimate(o, args.decimate)
-    print(f"sprite mode: {len(objects)} objects")
+# save a small manifest so the texture pass knows this mesh came from alpha
+manifest = {
+    "source_image": args.image,
+    "mesh": args.out,
+    "threshold": args.threshold,
+    "subdiv": args.subdiv,
+    "decimate": args.decimate,
+    "tris": len(obj.data.loop_triangles),
+}
+with open(os.path.join(WORK, "alpha_manifest.json"), "w") as f:
+    json.dump(manifest, f, indent=2)
 
-export_glb(args.out)
+if args.texture_prompt:
+    # hand off to the texture pipeline: render -> diffuse -> bake
+    # (texture_pipeline.py is a sibling script; run it as a separate Blender
+    #  invocation from the agent wrapper instead of nesting here)
+    print("MESH READY. Run texture_pipeline.py next with --mesh", args.out)

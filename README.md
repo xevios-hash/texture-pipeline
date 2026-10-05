@@ -1,44 +1,58 @@
 # texture-pipeline
 
-End-to-end asset pipeline: **alpha image -> mesh -> textured GLB**.
+Multi-view texture generation pipeline for 3D meshes. Two entry modes:
 
-Four passes, driven by one agent-facing function:
+- **Mesh in** -> orbiting views -> OpenRouter diffusion -> bake -> textured GLB
+- **Alpha image in** -> alpha-to-geometry mesh -> (same texture pipeline)
 
-1. **alpha_to_geometry.py** — traces the alpha channel of an image into a mesh (plane mode: subdivide + delete low-alpha faces; sprite mode: connected components, one mesh per blob). Decimates to a target triangle budget.
-2. **texture_pipeline.py** — Blender renders N orbiting views with transparent backgrounds, writes `manifest.json`.
-3. **openrouter_texture.py** — calls `POST https://openrouter.ai/api/v1/images` per view, sending each rendered view as an `input_reference` so the diffusion model edits in place. Default: `bytedance-seed/seedream-4.5` (~$0.01/image). Swappable to Flux 2 Pro or Nano Banana 2.
-4. **texture_pipeline.py --bake** — projects each diffused view onto the UV atlas (per-triangle, most face-on camera wins), assigns to a Principled BSDF, exports GLB.
+Designed so an LLM agent (e.g. MiMo-V2.6 via OpenCode) drives everything
+with one function call.
+
+## Pipeline
+
+```
+alpha image ──> [alpha_to_geometry] ──> mesh ──> [render views] ──> [OpenRouter diffuse] ──> [bake UVs] ──> textured GLB
+```
+
+1. **Alpha-to-geometry** (`alpha_to_geometry.py`) — trace the alpha channel into a subdivided, displaced mesh. Transparent parts get deleted, topology gets re-unwrapped. Optional decimate for mobile budgets.
+2. **Render pass** (`texture_pipeline.py`) — Blender renders N orbiting views, writes `manifest.json`.
+3. **Diffusion pass** (`openrouter_texture.py`) — `POST /api/v1/images` per view with the render as `input_reference`. Default: `bytedance-seed/seedream-4.5`.
+4. **Bake pass** (`texture_pipeline.py --bake`) — project views onto UVs, export GLB.
 
 ## Usage
 
 ```bash
 export OPENROUTER_API_KEY=sk-or-v1-...
-export BLENDER_BIN=blender   # optional
+export BLENDER_BIN=blender
 
-# full pipeline: alpha image -> textured GLB
-python ai_texture_agent.py bush.png "dense green foliage, soft studio light" bush_textured.glb
+# alpha image -> textured GLB (full pipeline)
+python ai_texture_agent.py --image bush.png "dense green foliage, soft studio light" bush_textured.glb
 
-# or just the alpha->mesh pre-pass
-blender -b -P alpha_to_geometry.py -- --image bush.png --out bush.glb --mode plane --subdiv 8 --decimate 0.05
+# existing mesh -> textured GLB
+python ai_texture_agent.py --mesh bush.glb "dense green foliage, soft studio light" bush_textured.glb
 ```
 
-## Agent wrapper
+## Why the texture must re-run after alpha meshing
 
-```python
-from ai_texture_agent import texture_asset
-texture_asset("bush.png", "dense green foliage, soft studio light", "bush_textured.glb")
-```
+Alpha-to-geometry **changes the mesh topology** — new faces, new UVs, different
+triangle layout. A texture baked against the old mesh's UVs will not line up
+with the new ones. So the rule is strict: after any mesh-changing step,
+re-render and re-diffuse from scratch. The agent wrapper enforces this by
+always running render -> diffuse -> bake as a fresh sequence on whatever mesh
+it receives.
 
 ## Cost
 
-~6 views x ~$0.01-0.05 = a few cents per asset. The LLM orchestrator (MiMo-V2.6, Claude, etc.) never touches pixels directly.
+~6 views x ~$0.01-0.05 = a few cents per asset. The LLM orchestrator never
+touches pixels directly.
 
 ## Known limits
 
-- The bake pass is naive per-triangle rasterization. Seams and aliasing will show on complex meshes; for production swap for xatlas + a proper projection step.
-- Plane mode produces flat cards — displacement or a later remesh pass is needed for true 3D volume (leaves, bark).
-- Sprite mode needs clean separation between blobs; overlapping alpha will merge them.
-- Output is a standard GLB with a PBR albedo map — RealityKit / SceneKit on iOS load it directly.
+- Bake pass is naive per-triangle rasterization. Seams on complex meshes;
+  swap for xatlas + proper projection in production.
+- Alpha meshing displaces along normals only — no overhangs or true volume.
+  For real 3D volume you'd need voxel remesh / marching cubes (different pass).
+- Requires Blender 4.x and Python 3.10+ with `requests`.
 
 ## License
 
