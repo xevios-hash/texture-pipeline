@@ -1,4 +1,4 @@
-; Godot 4 project. Open this folder in Godot after a world export.
+; Godot 4. Open this folder and press Play after oneshot.py.
 config_version=5
 
 [application]
