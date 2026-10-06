@@ -1,0 +1,9 @@
+{
+  "skill": "texture-pipeline",
+  "test_cases": [
+    {"input": "run the one-shot godot level", "should_trigger": true},
+    {"input": "paint this mesh higgsfield style and export a glb", "should_trigger": true},
+    {"input": "rig the hero on replicate", "should_trigger": true},
+    {"input": "review this pull request for security", "should_trigger": false}
+  ]
+}

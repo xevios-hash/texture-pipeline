@@ -1,0 +1,8 @@
+{
+  "skill": "texture-pipeline",
+  "test_cases": [
+    {"name": "graybox", "input": "build the playable level", "assertions": ["runs run_oneshot.sh", "does not call Meshy or Hunyuan", "tells the user to open game/ in Godot"]},
+    {"name": "paint", "input": "paint the bush and rebuild", "assertions": ["passes --paint", "requires OPENROUTER_API_KEY", "still finishes if the key is missing"]},
+    {"name": "move prop", "input": "move the crate", "assertions": ["edits worlds/clearing.json", "reruns the one shot", "does not regenerate the crate mesh"]}
+  ]
+}
