@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
-"""oneshot.py — build a playable graybox in one command.
+"""oneshot.py — one command from nothing to a Godot level.
 
-Does not need OpenRouter or Mixamo. If OPENROUTER_API_KEY is set and --paint
-is passed, bushes go through the texture pipeline. Otherwise primitives.
+Always produces a playable graybox. Extra stages run only if their
+credential or file is already present. A missing token skips that stage.
+It does not fail the level.
 
     python oneshot.py
-    python oneshot.py --paint
+    python oneshot.py --paint          # needs OPENROUTER_API_KEY
 
+Rigging runs when REPLICATE_API_TOKEN is set (cloud UniRig).
+Clips in clips/<name>.fbx are retargeted onto the rigged hero.
 Then open game/ in Godot 4 and press Play.
 """
 from __future__ import annotations
@@ -28,14 +31,24 @@ def run(cmd: list[str]) -> None:
     subprocess.run(cmd, check=True)
 
 
+def try_run(cmd: list[str], label: str) -> bool:
+    print("+", " ".join(cmd), flush=True)
+    r = subprocess.run(cmd)
+    if r.returncode != 0:
+        print(f"SKIP {label}: exit {r.returncode}")
+        return False
+    return True
+
+
 def main() -> None:
     p = argparse.ArgumentParser()
-    p.add_argument("--paint", action="store_true", help="texture bushes if OPENROUTER_API_KEY is set")
+    p.add_argument("--paint", action="store_true")
     a = p.parse_args()
 
     assets = ROOT / "assets"
     worlds = ROOT / "worlds"
     game = ROOT / "game"
+    clips = ROOT / "clips"
     assets.mkdir(exist_ok=True)
     worlds.mkdir(exist_ok=True)
 
@@ -43,13 +56,34 @@ def main() -> None:
     run([sys.executable, str(ROOT / "primitive_mesh.py"), "--kind", "plane", "--out", str(assets / "bush.glb"), "--size", "1.4"])
 
     if a.paint and os.environ.get("OPENROUTER_API_KEY"):
-        run([sys.executable, str(ROOT / "ai_texture_agent.py"), str(assets / "bush.glb"),
-             "dense green bush, cutout foliage", "--mesh", str(assets / "bush.glb")])
+        try_run([
+            sys.executable, str(ROOT / "ai_texture_agent.py"), str(assets / "bush.glb"),
+            "dense green bush, cutout foliage", "--mesh", str(assets / "bush.glb"), "--no-displace",
+        ], "paint")
     elif a.paint:
         print("SKIP paint: OPENROUTER_API_KEY not set")
 
-    run([BLENDER, "-b", "-P", str(ROOT / "anim" / "placeholder_hero.py"), "--",
-         "--out", str(assets / "hero.glb")])
+    hero = assets / "hero.glb"
+    run([BLENDER, "-b", "-P", str(ROOT / "anim" / "placeholder_hero.py"), "--", "--out", str(hero)])
+
+    player = hero
+    if os.environ.get("REPLICATE_API_TOKEN"):
+        rigged = assets / "hero_rigged.glb"
+        if try_run([
+            sys.executable, str(ROOT / "anim" / "cloud_rig.py"),
+            "--mesh", str(hero), "--out", str(rigged),
+        ], "cloud rig"):
+            player = rigged
+            for clip in sorted(clips.glob("*.fbx")) if clips.exists() else []:
+                out = assets / f"hero_{clip.stem}.glb"
+                if try_run([
+                    BLENDER, "-b", "-P", str(ROOT / "anim" / "retarget_mixamo.py"), "--",
+                    "--mesh", str(player), "--clip", str(clip),
+                    "--out", str(out), "--name", clip.stem,
+                ], f"retarget {clip.name}"):
+                    player = out
+    else:
+        print("SKIP rig: REPLICATE_API_TOKEN not set")
 
     spec = {
         "name": "clearing",
@@ -74,9 +108,9 @@ def main() -> None:
          "--spec", str(world_spec), "--out", str(worlds / "clearing.glb")])
 
     shutil.copyfile(worlds / "clearing.glb", game / "world.glb")
-    shutil.copyfile(assets / "hero.glb", game / "hero.glb")
-    shutil.copyfile(ROOT / "game" / "state_machine.example.json", game / "state_machine.json")
-    loop = json.loads((ROOT / "game" / "loop.example.json").read_text(encoding="utf-8"))
+    shutil.copyfile(player, game / "hero.glb")
+    shutil.copyfile(game / "state_machine.example.json", game / "state_machine.json")
+    loop = json.loads((game / "loop.example.json").read_text(encoding="utf-8"))
     (game / "loop.json").write_text(json.dumps(loop, indent=2), encoding="utf-8")
     (game / "game.json").write_text(json.dumps({
         "world": "res://world.glb",

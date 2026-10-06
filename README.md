@@ -1,61 +1,58 @@
 # texture-pipeline
 
-Higgsfield-style texturing. No text-to-3D shape model.
-
-An LLM writes a GLB. That GLB can be a plane or a cube — `primitive_mesh.py`
-emits one with no dependencies. A diffusion model paints it. Alpha and
-displacement turn the paint into actual mesh detail.
-
-```
-LLM  -->  plane or cube GLB
-              |
-              v
-        render orbiting views (Blender)
-              |
-              v
-        OpenRouter image model paints each view   <-- the Higgsfield step
-              |
-              v
-        bake views onto UVs
-              |
-              v
-        alpha cut + displace the card into a silhouette
-              |
-              v
-        optional voxel remesh (closes it into a volume; texture re-bakes)
-```
-
-## Usage
+One command builds a playable Godot level. Painting and rigging run in that
+same command when their tokens are set. They are not separate steps you have
+to remember.
 
 ```bash
-export OPENROUTER_API_KEY=sk-or-v1-...
+# macOS
+./run_oneshot.sh
 
-# bush: plane, painted, cut to the alpha
-python ai_texture_agent.py bush.glb "dense green bush, cutout foliage, no background" \
-  --primitive plane
+# Windows
+run_oneshot.bat
 
-# crate: cube, paint only, do not cut the silhouette
-python ai_texture_agent.py crate.glb "weathered wood crate" \
-  --primitive cube --no-displace
-
-# LLM already wrote the GLB
-python ai_texture_agent.py prop.glb "rusty metal panel" --mesh prop.glb
+# painted bushes, if OPENROUTER_API_KEY is set
+./run_oneshot.sh --paint
 ```
 
-## What each file does
+Then open `game/` in Godot 4 and press Play. WASD moves, Shift sprints, J attacks.
+Walk to the marker to win. The scene reloads.
 
-| File | Role |
-|------|------|
-| `primitive_mesh.py` | Cube or plane GLB. This is what the LLM calls instead of a 3D generator. |
-| `texture_pipeline.py` | Render views, bake them back. |
-| `openrouter_texture.py` | Stable-diffusion-class paint via OpenRouter (`seedream-4.5` default). |
-| `alpha_to_geometry.py` | Texture alpha becomes the mesh. |
-| `voxel_remesh.py` | Optional close-the-volume pass. |
-| `unirig_rig.py` | Optional, last. |
+Requires Blender on PATH, or `BLENDER_BIN`. On a Mac the launcher uses
+`/Applications/Blender.app/Contents/MacOS/Blender` if that exists.
 
-`shape_gen.py` is leftover from a Hunyuan front end. Do not use it for this path.
+## What the one shot always does
 
-## Cost
+1. Writes a crate and a bush GLB. No shape model.
+2. Writes a capsule hero with idle and walk bobs, so the level plays with no Mixamo.
+3. Builds `worlds/clearing.json` and a terrain GLB with scattered bushes.
+4. Copies the world, the hero, the state machine, and the loop into `game/`.
+5. Godot adds collision to every mesh, follows the camera, and reads the brain.
 
-Six painted views at Seedream 4.5 is about $0.24. The mesh is free.
-A second bake after voxel remesh doubles the image spend.
+## What it adds when credentials exist
+
+| Env | Stage |
+|-----|--------|
+| `OPENROUTER_API_KEY` and `--paint` | Paints the bush through the view-bake path. |
+| `REPLICATE_API_TOKEN` | Rigs the hero on Replicate (`anim/cloud_rig.py`). |
+| `clips/*.fbx` plus the token above | Retargets each clip onto that rig by bone name. |
+
+A missing token skips that stage and still writes the level. Mixamo is not
+scraped. Drop FBX files in `clips/` yourself.
+
+## After the first play
+
+Edit JSON, then rerun the one shot. Do not regenerate a mesh to move a bush.
+
+- `worlds/clearing.json` — instances, scatter, terrain seed
+- `game/state_machine.json` — states and transitions
+- `game/loop.json` — health, goal, win and fail
+
+`game/brain.gd` reads those files. Gameplay code in `game/main.gd` should not
+be rewritten to change a transition.
+
+## What this is not
+
+Not a 3D generator. Not Tripo, Meshy, or Hunyuan. `shape_gen.py` is leftover;
+do not use it. Not an AAA pipeline. The cloud rig is a community Replicate
+model, and its bone names may not match Mixamo until you check the armature.
